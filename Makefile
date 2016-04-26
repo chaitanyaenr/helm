@@ -1,8 +1,6 @@
-SHORT_NAME := helm
-DEIS_REGISTRY ?= ${DEV_REGISTRY}
-IMAGE_PREFIX ?= helm
+export GO15VENDOREXPERIMENT=1
 
-REPO_PATH := github.com/helm/${SHORT_NAME}
+REPO_PATH := github.com/helm/helm
 
 # The following variables describe the containerized development environment
 # and other build options
@@ -10,88 +8,87 @@ BIN_DIR := bin
 DIST_DIR := _dist
 GO_PACKAGES := action chart config dependency log manifest release plugins/sec plugins/example codec
 MAIN_GO := helm.go
-HELM_BIN := $(BIN_DIR)/helm
-PATH_WITH_HELM = PATH="$(shell pwd)/$(BIN_DIR):$(PATH)"
+HELM_BIN := ${BIN_DIR}/helm
+
 VERSION := $(shell git describe --tags --abbrev=0 2>/dev/null)+$(shell git rev-parse --short HEAD)
-DEV_ENV_IMAGE := quay.io/deis/go-dev:0.9.0
+
+DEV_ENV_IMAGE := quay.io/deis/go-dev:0.10.0
 DEV_ENV_WORK_DIR := /go/src/${REPO_PATH}
 DEV_ENV_CMD := docker run --rm -v ${CURDIR}:${DEV_ENV_WORK_DIR} -w ${DEV_ENV_WORK_DIR} ${DEV_ENV_IMAGE}
 DEV_ENV_CMD_INT := docker run -it --rm -v ${CURDIR}:${DEV_ENV_WORK_DIR} -w ${DEV_ENV_WORK_DIR} ${DEV_ENV_IMAGE}
-LDFLAGS := "-s -X main.version=${VERSION}"
+LDFLAGS := "-X ${REPO_PATH}/cli.version=${VERSION}"
 
-
-
-# Allow developers to step into the containerized development environment
-
-# Containerized dependency resolution
-
-bootstrap: check-docker 
-	${DEV_ENV_CMD} glide install
+PATH_WITH_HELM = PATH=${DEV_ENV_WORK_DIR}/${BIN_DIR}:$$PATH
 
 check-docker:
 	@if [ -z $$(which docker) ]; then \
-		echo "Missing \`docker\` client which is required for development"; \
+		echo "Missing \`docker\` client which is required for development and testing"; \
 		exit 2; \
 	fi
+
+# Allow developers to step into the containerized development environment
+dev: check-docker
+	${DEV_ENV_CMD_INT} bash
+
+# Containerized dependency resolution
+bootstrap: check-docker 
+	${DEV_ENV_CMD} glide install
+
 # Containerized build of the binary
 build: check-docker
-	mkdir -p ${BIN_DIR}
-	make binary-build
+	${DEV_ENV_CMD} make native-build
 
-docker-build: build check-docker
-	docker build --rm -t ${IMAGE} rootfs
-	docker tag -f ${IMAGE} ${MUTABLE_IMAGE}
+# Builds the binary for the native OS and architecture.
+# This can be run directly to compile for one's own system if desired.
+# It can also be run within a container (which will compile for Linux/64) using `make build`
+native-build: 
+	go build -o ${HELM_BIN} -ldflags ${LDFLAGS} ${MAIN_GO}
 
-
-# Builds the binary-- this should only be executed within the
-# containerized development environment.
-
-binary-build:
-	make build-all
-	@cd $(DIST_DIR) && \
-	find * -type d -exec zip -jr helm-$(VERSION)-{}.zip {} \; && \
-	cd -
-
-build-all:
+# Containerized build of binaries for all supported OS and architectures
+build-all: check-docker
 	${DEV_ENV_CMD} gox -verbose \
-	-ldflags "-X github.com/helm/helm/cli.version=${VERSION}" \
+	-ldflags ${LDFLAGS} \
 	-os="linux darwin " \
 	-arch="amd64 386" \
-	-output="$(DIST_DIR)/{{.OS}}-{{.Arch}}/{{.Dir}}" .
+	-output="${DIST_DIR}/{{.OS}}-{{.Arch}}/{{.Dir}}" .
+
+clean:
+	rm -rf ${DIST_DIR} ${BIN_DIR}
+
+dist: build-all
+	${DEV_ENV_CMD} bash -c 'cd ${DIST_DIR} && find * -type d -exec zip -jr helm-${VERSION}-{}.zip {} \;'
+
+install:
+	install -d ${DESTDIR}/usr/local/bin/
+	install -m 755 ${HELM_BIN} ${DESTDIR}/usr/local/bin/helm
 
 prep-bintray-json:
 # TRAVIS_TAG is set to the tag name if the build is a tag
 ifdef TRAVIS_TAG
-	@jq '.version.name |= "$(VERSION)"' _scripts/ci/bintray-template.json | \
+	${DEV_ENV_CMD} jq '.version.name |= "${VERSION}"' _scripts/ci/bintray-template.json | \
 		jq '.package.repo |= "helm"' > _scripts/ci/bintray-ci.json
 else
-	@jq '.version.name |= "$(VERSION)"' _scripts/ci/bintray-template.json \
+	${DEV_ENV_CMD} jq '.version.name |= "${VERSION}"' _scripts/ci/bintray-template.json \
 		> _scripts/ci/bintray-ci.json
 endif
 
 quicktest:
-	${DEV_ENV_CMD} go test -short ./ $(addprefix ./,$(GO_PACKAGES))
+	${DEV_ENV_CMD} bash -c '${PATH_WITH_HELM} go test -short ./ $(addprefix ./,${GO_PACKAGES})'
 
-test:
-	${DEV_ENV_CMD} go test -v ./ $(addprefix ./,$(GO_PACKAGES))
+test: test-style
+	${DEV_ENV_CMD} bash -c '${PATH_WITH_HELM} go test -v ./ $(addprefix ./,${GO_PACKAGES})'
 
 test-style:
-	@if [ $(shell gofmt -e -l -s *.go $(GO_PACKAGES)) ]; then \
-		echo "gofmt check failed:"; gofmt -e -l -s *.go $(GO_PACKAGES); exit 1; \
-	fi
-	@for i in . $(GO_PACKAGES); do \
-		golint $$i; \
-	done
-	@for i in . $(GO_PACKAGES); do \
-		go vet github.com/helm/helm/$$i; \
-	done
+	${DEV_ENV_CMD} gofmt -e -l -s *.go ${GO_PACKAGES}
+	@${DEV_ENV_CMD} bash -c 'gofmt -e -l -s *.go ${GO_PACKAGES} | read; if [ $$? == 0 ]; then echo "gofmt check failed."; exit 1; fi'
+	@${DEV_ENV_CMD} bash -c 'for i in . ${GO_PACKAGES}; do golint $$i; done'
+	@${DEV_ENV_CMD} bash -c 'for i in . ${GO_PACKAGES}; do go vet github.com/helm/helm/$$i; done'
 
-clean: check-docker
-	docker rmi ${IMAGE}
-
-
-.PHONY: bootstrap \
+.PHONY: check-docker \
+				dev \
+				bootstrap \
 				build \
+				native-build \
 				build-all \
 				clean \
 				dist \
@@ -99,5 +96,4 @@ clean: check-docker
 				prep-bintray-json \
 				quicktest \
 				test \
-				test-charts \
 				test-style
